@@ -2,12 +2,10 @@
 #include <rtos.h>
 #include <XBee900APIParser.h>
 
+DigitalOut led3(LED3);
+DigitalOut led4(LED4);
+
 XBee900APIParser::XBee900APIParser(PinName tx, PinName rx, int baud) : _modem(tx,rx,baud) {
-  // for (int i = 0; i < MAX_INCOMING_FRAMES; i++) {
-  //   _inFramesLengths[i] = 0;
-  // }
-  // _numInFrames = 0;
-  // _inBufferLength = -1;
   for (int i = 0; i < MAX_INCOMING_FRAMES; i++) {
     _frameBuffer.frame[i].type = 0xFF;
     _frameBuffer.frame[i].id = 0x00;
@@ -20,8 +18,35 @@ XBee900APIParser::XBee900APIParser(PinName tx, PinName rx, int baud) : _modem(tx
   _failedTransmits = 0;
   _maxFailedTransmits = 5;
   _frameAlertThreadId = NULL;
+  _frameCount = 0;
+  set_power_level(4);
   _updateBufferThread.start(callback(this, &XBee900APIParser::_move_frame_to_buffer));
   _modem.attach(callback(this,&XBee900APIParser::_pull_byte),SerialBase::RxIrq);
+}
+
+void XBee900APIParser::showAllBuffers() {
+  if (_frameBufferMutex.trylock_for(_time_out)) {
+    printf("Frame Buffer:\r\n");
+    if (_frameBuffer.length>0) {
+      for (int i = 0; i < _frameBuffer.length; i++) {
+        printf("Index: %d, Type: %02X, ID: %d, Length: %d \t", i, _frameBuffer.frame[i].type, _frameBuffer.frame[i].id, _frameBuffer.frame[i].length);
+        for (int j = 0; j < _frameBuffer.frame[i].length; j++)
+          printf("%02X ",_frameBuffer.frame[i].data[j]);
+        printf("\r\n");
+      }
+    }
+    printf("\r\n");
+    printf("Partial Frame:\r\n");
+    printf("Status: %d, Type: %02X, ID: %d, Length: %d \t", _partialFrame.status, _partialFrame.frame.type, _partialFrame.frame.id, _partialFrame.frame.length);
+    for (int j = 0; j < _partialFrame.frame.length; j++)
+      printf("%02X ",_partialFrame.frame.data[j]);
+    printf("\r\n\r\n");
+    _frameBufferMutex.unlock();
+  }
+}
+
+char XBee900APIParser::get_next_frame_id() {
+  return _frameCount++;
 }
 
 bool XBee900APIParser::associated() {
@@ -68,10 +93,10 @@ bool XBee900APIParser::find_frame(char frameType, apiFrame_t* frame) {
   return find_frame(frameType, 0xFF, frame);
 }
 
-void XBee900APIParser::flush_old_frames(char frameType, char frameID) {
-  apiFrame_t frame;
-  while (find_frame(frameType, frameID, &frame));
-}
+// void XBee900APIParser::flush_old_frames(char frameType, char frameID) {
+//   apiFrame_t frame;
+//   while (find_frame(frameType, frameID, &frame));
+// }
 
 uint64_t XBee900APIParser::get_address(string ni) {
   uint64_t address;
@@ -82,7 +107,7 @@ uint64_t XBee900APIParser::get_address(string ni) {
   int len;
   bool foundFrame;
   _make_AT_frame("DN", ni, &frame);
-  flush_old_frames(frame.type, frame.id);
+  // flush_old_frames(frame.type, frame.id);
   frameID = frame.id;
   send(&frame);
   wait_ms(5);
@@ -96,7 +121,7 @@ uint64_t XBee900APIParser::get_address(string ni) {
   if ((!foundFrame) || (frame.length != 3)) return 0;
   if (!((frame.data[0] = 'D') && (frame.data[1] == 'N') && (frame.data[2]==0))) return 1;
   _make_AT_frame("DH", &frame);
-  flush_old_frames(frame.type, frame.id);
+  // flush_old_frames(frame.type, frame.id);
   frameID = frame.id;
   send(&frame);
   t.reset();
@@ -112,7 +137,7 @@ uint64_t XBee900APIParser::get_address(string ni) {
     address = (address << 8) | frame.data[3+i];
   }
   _make_AT_frame("DL", &frame);
-  flush_old_frames(frame.type, frame.id);
+  // flush_old_frames(frame.type, frame.id);
   frameID = frame.id;
   send(&frame);
   t.reset();
@@ -151,6 +176,34 @@ char XBee900APIParser::last_RSSI() {
     }
   }
   return rssi;
+}
+
+char XBee900APIParser::set_power_level(char pl) {
+  Timer t;
+  char frameID;
+  char rssi = 0xFF;
+  string plstr;
+  apiFrame_t frame;
+  bool foundFrame;
+  switch (pl) {
+    case 0: plstr = "0"; break;
+    case 1: plstr = "1"; break;
+    case 2: plstr = "2"; break;
+    case 3: plstr = "3"; break;
+    case 4: plstr = "4"; break;
+    default: plstr = "4";
+  }
+  _make_AT_frame("PL", plstr, &frame);
+  frameID = frame.id;
+  send(&frame);
+  t.start();
+  foundFrame = false;
+  while ((t.read_ms()<2*_time_out) && (!foundFrame)) {
+    foundFrame = find_frame(0x88, frameID, &frame);
+    if (!foundFrame) wait_ms(5);
+  }
+  if (!foundFrame) return 0xFF;
+  return frame.data[4];
 }
 
 bool XBee900APIParser::readable() {
@@ -261,35 +314,39 @@ void XBee900APIParser::set_timeout(int time_ms) {
   if ((time_ms > 0) && (time_ms < 5000)) _time_out = time_ms;
 }
 
+/* Transmit frame changes from 802.15.4 2.4 GHz to 900 MHz Point2Multipoint
+* Outgoing frame is now 0x10 (was 0x00)
+* Response frame is now 0x8B (was 0x89)
+*/
 int XBee900APIParser::txAddressed(uint64_t address, char* payload, int len) {
   if (len>(MAX_FRAME_LENGTH)) return -1;
   apiFrame_t frame;
   bool foundFrame;
-  char frameID = 0x00;
-  for (int i = 0; i < len; i++) {
-    frameID = frameID + payload[i];
-  }
-  frame.type = 0x00; // Tx Request Frame Type
+  char frameID = get_next_frame_id();
+  frame.type = 0x10; // Tx Request Frame Type
   frame.id = frameID;
   for (int i = 0; i < 8; i++) {
     frame.data[i] = (address >> ((7-i)*8)) & 0xFF;
   }
-  frame.data[8] = 0x00;  // No options
+  frame.data[8] = 0xFF;  // Reserved value (no choice)
+  frame.data[9] = 0xFE; // Reserved value (no choice)
+  frame.data[10] = 0;  // Broadcast radius (0 = max)
+  frame.data[11] = 0x00;  // No options selected
   for (int i = 0; i < len; i++) {
-    frame.data[9+i] = payload[i];
+    frame.data[12+i] = payload[i];
   }
-  frame.length = len + 9;
+  frame.length = len + 12;
   send(&frame);
   Timer t;
   t.start();
   foundFrame = false;
   wait_ms(7);
   while ((t.read_ms()<2*_time_out) && (!foundFrame)) {
-    foundFrame = find_frame(0x89, frameID, &frame);
+    foundFrame = find_frame(0x8B, frameID, &frame);
     if (!foundFrame) wait_ms(7);
   }
   if (foundFrame) {
-    if (frame.data[0] == 0x00) {
+    if (frame.data[3] == 0x00) {
       _failedTransmits = 0;
       return 0;
     } else {
@@ -338,7 +395,7 @@ void XBee900APIParser::_make_AT_frame(string cmd, string param, apiFrame_t* fram
     frame->data[0] = cmd[0];
     frame->data[1] = cmd[1];
   }
-  frame->id = cmd[0] + cmd[1];
+  frame->id = get_next_frame_id();
   if (param.length()>0) {
     for (int i = 0; i < param.length(); i++)
       frame->data[2+i] = param[i];
@@ -370,12 +427,15 @@ void XBee900APIParser::_pull_byte() {
       case 0x03: // Frame type
         _partialFrame.frame.type = buff;
         switch (buff) { // frame types with FrameID
-          case 0x00: _partialFrame.status = 0x04; break;
-          case 0x08: _partialFrame.status = 0x04; break;
-          case 0x17: _partialFrame.status = 0x04; break;
-          case 0x88: _partialFrame.status = 0x04; break;
-          case 0x89: _partialFrame.status = 0x04; break;
-          case 0x97: _partialFrame.status = 0x04; break;
+          case 0x00:
+          case 0x10:
+          case 0x08:
+          case 0x17:
+          case 0x88:
+          case 0x89:
+          case 0x8B:
+          case 0x97: 
+            _partialFrame.status = 0x04; break;
           default: // No Frame ID for this type
             _partialFrame.frame.id = 0xFF;
             _partialFrame.frame.length++;
@@ -395,12 +455,16 @@ void XBee900APIParser::_pull_byte() {
           _partialFrame.rcvd++;
         } else { // This should be the checksum
           switch (_partialFrame.frame.type) { // frame types with FrameID
-            case 0x00: checksum = _partialFrame.frame.type + _partialFrame.frame.id; break;
-            case 0x08: checksum = _partialFrame.frame.type + _partialFrame.frame.id; break;
-            case 0x17: checksum = _partialFrame.frame.type + _partialFrame.frame.id; break;
-            case 0x88: checksum = _partialFrame.frame.type + _partialFrame.frame.id; break;
-            case 0x89: checksum = _partialFrame.frame.type + _partialFrame.frame.id; break;
-            case 0x97: checksum = _partialFrame.frame.type + _partialFrame.frame.id; break;
+            case 0x00:
+            case 0x08:
+            case 0x10:
+            case 0x17:
+            case 0x88:
+            case 0x89:
+            case 0x8B:
+            case 0x97:
+              checksum = _partialFrame.frame.type + _partialFrame.frame.id;
+              break;
             default: // No Frame ID for this type
               checksum = _partialFrame.frame.type;
           }
@@ -411,9 +475,6 @@ void XBee900APIParser::_pull_byte() {
             if (_partialFrame.frame.type == 0x8A) { // Intercept modem status frames
               switch (_partialFrame.frame.data[0]) {
                 case 0x02:
-                  _isAssociated = true;
-                  _failedTransmits = 0;
-                  break;
                 case 0x06:
                   _isAssociated = true;
                   _failedTransmits = 0;

@@ -9,8 +9,8 @@
 #ifndef XBEE_900_API_PARSER_H
 #define XBEE_900_API_PARSER_H
 
-#include "mbed.h"
-#include "rtos.h"
+#include <mbed.h>
+#include <rtos.h>
 #include <string> 
 using namespace std;
 
@@ -46,6 +46,7 @@ private:
     int _time_out;
     int _failedTransmits;
     int _maxFailedTransmits;
+    char _frameCount;
 
     volatile bool _isAssociated;
 
@@ -80,8 +81,11 @@ public:
     void set_timeout(int time_ms);
     void set_max_failed_transmits(int maxFails);
     char last_RSSI();
+    char set_power_level(char pl);
     uint64_t get_address(string ni);
     void set_frame_alert_thread_id(osThreadId_t threadID);
+    char get_next_frame_id();
+    void showAllBuffers();
 };
 
 #endif
